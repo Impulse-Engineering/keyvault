@@ -27,8 +27,13 @@
 #                [--with-cache] [--ssh-key]
 #
 # Flags:
-#   --fleet F         which fleet token this host reads (pve|vm). Required on
-#                     first run; later runs keep the existing config.
+#   --fleet F         which access profile this host uses. Required on first
+#                     run; later runs keep the existing config.
+#                       pve — reads a token scoped to the Proxmox repo only
+#                             (hypervisors have a small, stable repo need)
+#                       vm  — reads an installation-wide read-only token, so
+#                             any repo the GitHub App is installed on works
+#                             without per-repo Vault config
 #   --vault-addr URL  override the default Vault address
 #   --vault-cacert P  path to an internal CA bundle for the Vault listener
 #   --with-cache      chain git's in-memory cache helper (25 min) before the
@@ -166,10 +171,18 @@ fi
 install -d -m 0755 "$CONF_DIR"
 if [[ ! -f "$CONF_DIR/config" ]]; then
   [[ -n "$FLEET" ]] || err "--fleet pve|vm required on first run (no existing $CONF_DIR/config)"
+  # pve hosts need exactly one repo, so they get a narrowly scoped token.
+  # General VMs pull arbitrary repos, so they read the installation-wide
+  # read-only token — the App's installed-repo list is the access boundary
+  # there, not this file.
+  case "$FLEET" in
+    pve) token_path="secret/github/fleet/pve/token" ;;
+    vm)  token_path="secret/github/read/all" ;;
+  esac
   {
     printf 'VAULT_ADDR=%s\n' "${VAULT_ADDR_ARG:-$DEFAULT_VAULT_ADDR}"
     [[ -n "$VAULT_CACERT_ARG" ]] && printf 'VAULT_CACERT=%s\n' "$VAULT_CACERT_ARG"
-    printf 'GIT_VAULT_TOKEN_PATH=secret/github/fleet/%s/token\n' "$FLEET"
+    printf 'GIT_VAULT_TOKEN_PATH=%s\n' "$token_path"
   } > "$CONF_DIR/config"
   chmod 0640 "$CONF_DIR/config"
   log "wrote $CONF_DIR/config (fleet=$FLEET)"
