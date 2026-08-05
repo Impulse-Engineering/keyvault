@@ -1,0 +1,4 @@
+# bootstrap/ ships root-executed code to the whole fleet — every change
+# requires a designated reviewer. Pair this with branch protection on master
+# (require PR + review, no force-push) or it is advisory only.
+/bootstrap/ @jessiebryan
