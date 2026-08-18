@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# git-vault-install-client-cert — validate and install a Vault Agent-rendered
+# client certificate/key pair. Invoked by Vault Agent as root after pkiCert.
+
+set -euo pipefail
+
+RENDERED="${1:-/run/vault-agent/rendered-client-cert}"
+CLIENT_KEY="${2:-/etc/git-vault/client.key}"
+CLIENT_CERT="${3:-/etc/git-vault/client.crt}"
+
+fail() { printf 'git-vault-install-client-cert: %s\n' "$*" >&2; exit 1; }
+
+[[ $EUID -eq 0 ]] || fail "must run as root"
+[[ "$RENDERED" = /* ]] || fail "rendered certificate path must be absolute"
+[[ -f "$RENDERED" ]] || fail "rendered certificate file missing: $RENDERED"
+[[ "$CLIENT_KEY" = /* && "$CLIENT_CERT" = /* ]] || fail "client key/certificate paths must be absolute"
+[[ ! -L "$CLIENT_KEY" && ! -L "$CLIENT_CERT" ]] || fail "client key/certificate paths must not be symlinks"
+[[ -d "$(dirname "$CLIENT_KEY")" && -d "$(dirname "$CLIENT_CERT")" ]] \
+  || fail "client key/certificate parent directory is missing"
+
+file_mode_owner() {
+  local f="$1" perms owner mode grp oth
+  perms=$(stat -c '%u %a' "$f" 2>/dev/null || stat -f '%u %Lp' "$f")
+  read -r owner mode <<< "$perms"
+  [[ "$owner" == 0 ]] || fail "$f is not owned by root"
+  grp="${mode: -2:1}" ; oth="${mode: -1}"
+  [[ "$grp" == 0 && "$oth" == 0 ]] || fail "$f is not root-only (mode $mode)"
+}
+
+file_mode_owner "$RENDERED"
+command -v openssl >/dev/null || fail "openssl is required"
+
+tmp_dir="$(mktemp -d)"
+cleanup() { rm -rf "$tmp_dir"; }
+trap cleanup EXIT
+chmod 0700 "$tmp_dir"
+
+awk_section() {
+  local begin="$1" end="$2"
+  awk -v begin="$begin" -v end="$end" '
+    $0 == begin { inside=1; next }
+    $0 == end { inside=0; next }
+    inside { print }
+  ' "$RENDERED"
+}
+
+awk_section '# KEY-BEGIN' '# KEY-END' > "$tmp_dir/client.key"
+awk_section '# CERT-BEGIN' '# CERT-END' > "$tmp_dir/client.crt"
+[[ -s "$tmp_dir/client.key" ]] || fail "rendered client key section is empty"
+[[ -s "$tmp_dir/client.crt" ]] || fail "rendered client certificate section is empty"
+
+openssl pkey -in "$tmp_dir/client.key" -noout >/dev/null 2>&1 \
+  || fail "rendered client key is not valid PEM"
+openssl x509 -in "$tmp_dir/client.crt" -noout -checkend 60 >/dev/null 2>&1 \
+  || fail "rendered client certificate is expired or expires within 60 seconds"
+
+key_pub="$(openssl pkey -in "$tmp_dir/client.key" -pubout 2>/dev/null)" \
+  || fail "cannot read public key from rendered client key"
+cert_pub="$(openssl x509 -in "$tmp_dir/client.crt" -pubkey -noout 2>/dev/null)" \
+  || fail "cannot read public key from rendered client certificate"
+[[ "$key_pub" == "$cert_pub" ]] \
+  || fail "rendered client certificate and key do not match"
+
+install -o root -g root -m 0600 "$tmp_dir/client.key" "${CLIENT_KEY}.new"
+install -o root -g root -m 0600 "$tmp_dir/client.crt" "${CLIENT_CERT}.new"
+mv -f "${CLIENT_KEY}.new" "$CLIENT_KEY"
+mv -f "${CLIENT_CERT}.new" "$CLIENT_CERT"
+
+printf 'installed validated client certificate: %s\n' "$CLIENT_CERT" >&2

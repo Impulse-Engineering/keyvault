@@ -8,22 +8,29 @@
 # What it does (idempotent, re-runnable, root):
 #   1. Installs the HashiCorp Vault CLI (Debian/apt or RHEL-family/dnf) and
 #      MASKS vault.service — these hosts are Vault clients, never servers.
-#   2. Writes /etc/git-vault/config (VAULT_ADDR, fleet token path).
+#   2. Writes /etc/git-vault/config (VAULT_ADDR, auth method, fleet token path).
 #   3. Installs the git-credential-vault helper (sha256-verified against the
 #      hash reviewed into THIS script) and scopes it to github.com only.
-#   4. --ssh-key: optional SSH fallback transport (see below).
+#   4. --auth-method agent: installs a root Vault Agent cert-auth profile and
+#      token sink; initial client certificate enrollment is out-of-band.
+#   5. --ssh-key: optional SSH fallback transport (see below).
 #
 # Supply chain: ALWAYS fetch this script and the helper pinned to a commit
 # SHA, never a branch:
 #   C=<reviewed commit sha>
 #   curl -fsSLO https://raw.githubusercontent.com/Impulse-Engineering/keyvault/$C/bootstrap/git-vault/bootstrap.sh
 #   curl -fsSLO https://raw.githubusercontent.com/Impulse-Engineering/keyvault/$C/bootstrap/git-vault/git-credential-vault
+#   curl -fsSLO https://raw.githubusercontent.com/Impulse-Engineering/keyvault/$C/bootstrap/git-vault/git-vault-install-client-cert
 #   bash bootstrap.sh --fleet pve
-# The helper is verified against EXPECTED_HELPER_SHA256 below; both files are
-# reviewed together, so a tampered helper cannot pass a clean bootstrap.
+# The helper and Agent installer are verified against their expected SHA-256
+# values below; all three files are reviewed together, so a tampered consumer
+# cannot pass a clean bootstrap.
 #
 # Usage:
-#   bootstrap.sh --fleet pve|vm [--vault-addr URL] [--vault-cacert PATH]
+#   bootstrap.sh --fleet pve|vm [--auth-method approle|agent]
+#                [--cert-role git-cert-vm|git-cert-pve|git-cert-archive]
+#                [--cert-hostname HOST] [--client-cert PATH] [--client-key PATH]
+#                [--agent-token PATH] [--vault-addr URL] [--vault-cacert PATH]
 #                [--with-cache] [--ssh-key]
 #
 # Flags:
@@ -36,6 +43,16 @@
 #                             without per-repo Vault config
 #   --vault-addr URL  override the default Vault address
 #   --vault-cacert P  path to an internal CA bundle for the Vault listener
+#   --auth-method M   approle (default; existing behavior) or agent. Agent
+#                     authenticates Vault Agent with the host client cert.
+#   --cert-role R     cert-auth role for the Agent profile. Defaults to
+#                     git-cert-pve for --fleet pve or git-cert-vm for --fleet vm.
+#                     Use git-cert-archive for an archive writer.
+#   --cert-hostname H hostname used in the client certificate CN/DNS SAN;
+#                     defaults to hostname -s.
+#   --client-cert P  initial client certificate (default /etc/git-vault/client.crt)
+#   --client-key P   initial client key (default /etc/git-vault/client.key)
+#   --agent-token P  Agent token sink (default /run/vault-agent/token)
 #   --with-cache      chain git's in-memory cache helper (25 min) before the
 #                     vault helper; git >=2.41 honors password_expiry_utc so
 #                     a cached token is never used past its GitHub expiry
@@ -49,20 +66,47 @@
 set -euo pipefail
 
 DEFAULT_VAULT_ADDR="https://vault.impeng.net:8200"
-EXPECTED_HELPER_SHA256="87509788d7df62dbff57f9fc358a443da7549f3bcecb6b78dee7582efa82963e"
+EXPECTED_HELPER_SHA256="662318a98133603b72c50f61fe39c638918e8f8e864ab7754b1132a2dcacd705"
+EXPECTED_INSTALLER_SHA256="7a0b822be9b8b9fbe5a4cbc4823470262802a7b493ced3f0e980f40d92975483"
 HELPER_DST=/usr/local/bin/git-credential-vault
+INSTALLER_DST=/usr/local/sbin/git-vault-install-client-cert
 CONF_DIR=/etc/git-vault
+AGENT_DIR=/etc/vault-agent
+AGENT_CONFIG="$AGENT_DIR/config.hcl"
+AGENT_TEMPLATE="$AGENT_DIR/git-client.ctmpl"
+AGENT_UNIT=/etc/systemd/system/vault-agent-git.service
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 log() { printf '%s: [%s] %s\n' "$(date)" "$(whoami)" "$*"; }
 err() { log "FATAL: $*"; exit 1; }
 
+root_only_file() {
+  local f="$1" perms owner mode group_bits other_bits
+  [[ -f "$f" ]] || err "$f missing"
+  perms=$(stat -c '%u %a' "$f" 2>/dev/null || stat -f '%u %Lp' "$f")
+  read -r owner mode <<< "$perms"
+  [[ "$owner" == 0 ]] || err "$f must be owned by root (owner=$owner)"
+  group_bits="${mode: -2:1}" ; other_bits="${mode: -1}"
+  [[ "$group_bits" == 0 && "$other_bits" == 0 ]] \
+    || err "$f must be root-only (mode 600 or stricter; got $mode)"
+}
+
 [[ $EUID -eq 0 ]] || err "must run as root"
 
-FLEET="" VAULT_ADDR_ARG="" VAULT_CACERT_ARG="" WITH_CACHE=false SSH_KEY_MODE=false
+FLEET="" VAULT_ADDR_ARG="" VAULT_CACERT_ARG="" AUTH_METHOD_ARG=""
+CERT_ROLE_ARG="" CERT_HOSTNAME_ARG="" CLIENT_CERT_ARG=/etc/git-vault/client.crt
+CLIENT_KEY_ARG=/etc/git-vault/client.key AGENT_TOKEN_ARG=/run/vault-agent/token
+CLIENT_CERT_SET=false CLIENT_KEY_SET=false AGENT_TOKEN_SET=false CERT_HOSTNAME_SET=false
+WITH_CACHE=false SSH_KEY_MODE=false
 while (( $# > 0 )); do
   case "$1" in
     --fleet)        FLEET="${2:?--fleet needs a value}"; shift 2 ;;
+    --auth-method)  AUTH_METHOD_ARG="${2:?--auth-method needs a value}"; shift 2 ;;
+    --cert-role)    CERT_ROLE_ARG="${2:?--cert-role needs a value}"; shift 2 ;;
+    --cert-hostname) CERT_HOSTNAME_ARG="${2:?--cert-hostname needs a value}"; CERT_HOSTNAME_SET=true; shift 2 ;;
+    --client-cert)  CLIENT_CERT_ARG="${2:?--client-cert needs a value}"; CLIENT_CERT_SET=true; shift 2 ;;
+    --client-key)   CLIENT_KEY_ARG="${2:?--client-key needs a value}"; CLIENT_KEY_SET=true; shift 2 ;;
+    --agent-token)  AGENT_TOKEN_ARG="${2:?--agent-token needs a value}"; AGENT_TOKEN_SET=true; shift 2 ;;
     --vault-addr)   VAULT_ADDR_ARG="${2:?--vault-addr needs a value}"; shift 2 ;;
     --vault-cacert) VAULT_CACERT_ARG="${2:?--vault-cacert needs a value}"; shift 2 ;;
     --with-cache)   WITH_CACHE=true; shift ;;
@@ -74,6 +118,12 @@ done
 if [[ -n "$FLEET" && "$FLEET" != "pve" && "$FLEET" != "vm" ]]; then
   err "--fleet must be pve or vm"
 fi
+if [[ -n "$AUTH_METHOD_ARG" && "$AUTH_METHOD_ARG" != "approle" && "$AUTH_METHOD_ARG" != "agent" ]]; then
+  err "--auth-method must be approle or agent"
+fi
+if [[ -n "$CERT_ROLE_ARG" && "$CERT_ROLE_ARG" != "git-cert-vm" && "$CERT_ROLE_ARG" != "git-cert-pve" && "$CERT_ROLE_ARG" != "git-cert-archive" ]]; then
+  err "--cert-role must be git-cert-vm, git-cert-pve, or git-cert-archive"
+fi
 # These values are written into files that are root-sourced and parsed by
 # systemd — validate hard so no shell metacharacters or newlines ride along.
 if [[ -n "$VAULT_ADDR_ARG" && ! "$VAULT_ADDR_ARG" =~ ^https?://[A-Za-z0-9.:_-]+$ ]]; then
@@ -81,6 +131,13 @@ if [[ -n "$VAULT_ADDR_ARG" && ! "$VAULT_ADDR_ARG" =~ ^https?://[A-Za-z0-9.:_-]+$
 fi
 if [[ -n "$VAULT_CACERT_ARG" && ! "$VAULT_CACERT_ARG" =~ ^[A-Za-z0-9./_-]+$ ]]; then
   err "--vault-cacert must be a plain filesystem path"
+fi
+for path_arg in "$CLIENT_CERT_ARG" "$CLIENT_KEY_ARG" "$AGENT_TOKEN_ARG"; do
+  [[ "$path_arg" = /* && "$path_arg" =~ ^[A-Za-z0-9./_-]+$ ]] \
+    || err "client/Agent paths must be absolute plain filesystem paths"
+done
+if [[ -n "$CERT_HOSTNAME_ARG" && ! "$CERT_HOSTNAME_ARG" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]]; then
+  err "--cert-hostname must be a short hostname label (letters, numbers, underscores, hyphens)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -169,26 +226,154 @@ fi
 # systemd EnvironmentFile — the renewer's units read this same file)
 # ---------------------------------------------------------------------------
 install -d -m 0755 "$CONF_DIR"
-if [[ ! -f "$CONF_DIR/config" ]]; then
-  [[ -n "$FLEET" ]] || err "--fleet pve|vm required on first run (no existing $CONF_DIR/config)"
-  # pve hosts need exactly one repo, so they get a narrowly scoped token.
-  # General VMs pull arbitrary repos, so they read the installation-wide
-  # read-only token — the App's installed-repo list is the access boundary
-  # there, not this file.
-  case "$FLEET" in
-    pve) token_path="secret/github/fleet/pve/token" ;;
-    vm)  token_path="secret/github/read/all" ;;
+fleet_token_path() {
+  case "$1" in
+    pve) printf '%s\n' 'secret/github/fleet/pve/token' ;;
+    vm)  printf '%s\n' 'secret/github/read/all' ;;
+    *)   err "internal error: unknown fleet '$1'" ;;
   esac
-  {
-    printf 'VAULT_ADDR=%s\n' "${VAULT_ADDR_ARG:-$DEFAULT_VAULT_ADDR}"
-    [[ -n "$VAULT_CACERT_ARG" ]] && printf 'VAULT_CACERT=%s\n' "$VAULT_CACERT_ARG"
-    printf 'GIT_VAULT_TOKEN_PATH=%s\n' "$token_path"
-  } > "$CONF_DIR/config"
-  chmod 0640 "$CONF_DIR/config"
-  log "wrote $CONF_DIR/config (fleet=$FLEET)"
-else
-  log "$CONF_DIR/config exists — keeping it (edit manually to change fleet/addr)"
+}
+
+fleet_cert_role() {
+  case "$1" in
+    pve) printf '%s\n' 'git-cert-pve' ;;
+    vm)  printf '%s\n' 'git-cert-vm' ;;
+    *)   err "internal error: unknown fleet '$1'" ;;
+  esac
+}
+
+CONFIG_EXISTS=false
+EXISTING_AUTH_METHOD=""
+EXISTING_ADDR=""
+EXISTING_CACERT=""
+EXISTING_TOKEN_PATH=""
+EXISTING_CERT_ROLE=""
+EXISTING_CERT_HOSTNAME=""
+EXISTING_CLIENT_CERT=""
+EXISTING_CLIENT_KEY=""
+EXISTING_AGENT_TOKEN=""
+if [[ -f "$CONF_DIR/config" ]]; then
+  CONFIG_EXISTS=true
+  EXISTING_AUTH_METHOD="$(sed -n 's/^GIT_VAULT_AUTH_METHOD=//p' "$CONF_DIR/config" | head -1)"
+  EXISTING_AUTH_METHOD="${EXISTING_AUTH_METHOD:-approle}"
+  EXISTING_ADDR="$(sed -n 's/^VAULT_ADDR=//p' "$CONF_DIR/config" | head -1)"
+  EXISTING_CACERT="$(sed -n 's/^VAULT_CACERT=//p' "$CONF_DIR/config" | head -1)"
+  EXISTING_TOKEN_PATH="$(sed -n 's/^GIT_VAULT_TOKEN_PATH=//p' "$CONF_DIR/config" | head -1)"
+  EXISTING_CERT_ROLE="$(sed -n 's/^GIT_VAULT_CERT_ROLE=//p' "$CONF_DIR/config" | head -1)"
+  EXISTING_CERT_HOSTNAME="$(sed -n 's/^GIT_VAULT_CERT_HOSTNAME=//p' "$CONF_DIR/config" | head -1)"
+  EXISTING_CLIENT_CERT="$(sed -n 's/^GIT_VAULT_CLIENT_CERT=//p' "$CONF_DIR/config" | head -1)"
+  EXISTING_CLIENT_KEY="$(sed -n 's/^GIT_VAULT_CLIENT_KEY=//p' "$CONF_DIR/config" | head -1)"
+  EXISTING_AGENT_TOKEN="$(sed -n 's/^GIT_VAULT_AGENT_TOKEN=//p' "$CONF_DIR/config" | head -1)"
 fi
+
+if [[ -n "$AUTH_METHOD_ARG" ]]; then
+  AUTH_METHOD="$AUTH_METHOD_ARG"
+else
+  AUTH_METHOD="$EXISTING_AUTH_METHOD"
+fi
+[[ "$AUTH_METHOD" == approle || "$AUTH_METHOD" == agent ]] \
+  || err "unsupported auth method in $CONF_DIR/config: $AUTH_METHOD"
+if [[ "$AUTH_METHOD" != agent && ( -n "$CERT_ROLE_ARG" || -n "$CERT_HOSTNAME_ARG" || $CLIENT_CERT_SET == true || $CLIENT_KEY_SET == true || $AGENT_TOKEN_SET == true ) ]]; then
+  err "certificate/Agent options require --auth-method agent"
+fi
+if $SSH_KEY_MODE && [[ "$AUTH_METHOD" != approle ]]; then
+  err "--ssh-key currently requires --auth-method approle"
+fi
+
+if ! $CONFIG_EXISTS; then
+  [[ -n "$FLEET" ]] || err "--fleet pve|vm required on first run (no existing $CONF_DIR/config)"
+  token_path="$(fleet_token_path "$FLEET")"
+  config_addr="${VAULT_ADDR_ARG:-$DEFAULT_VAULT_ADDR}"
+  config_cacert="$VAULT_CACERT_ARG"
+else
+  [[ -n "$EXISTING_TOKEN_PATH" ]] || err "$CONF_DIR/config has no GIT_VAULT_TOKEN_PATH"
+  # Existing behavior is intentionally keep-on-rerun. Switching auth method is
+  # explicit; --fleet then updates the token path for the explicit switch.
+  if [[ -n "$AUTH_METHOD_ARG" && -n "$FLEET" ]]; then
+    token_path="$(fleet_token_path "$FLEET")"
+  else
+    token_path="$EXISTING_TOKEN_PATH"
+  fi
+  config_addr="$EXISTING_ADDR"
+  [[ -n "$config_addr" ]] || err "$CONF_DIR/config has no VAULT_ADDR"
+  config_cacert="$EXISTING_CACERT"
+fi
+if [[ -n "$config_cacert" && ! "$config_cacert" =~ ^[A-Za-z0-9./_-]+$ ]]; then
+  err "VAULT_CACERT in $CONF_DIR/config must be a plain filesystem path"
+fi
+
+if [[ "$AUTH_METHOD" == agent ]]; then
+  if [[ -n "$CERT_ROLE_ARG" ]]; then
+    cert_role="$CERT_ROLE_ARG"
+  elif [[ -n "$EXISTING_CERT_ROLE" ]]; then
+    cert_role="$EXISTING_CERT_ROLE"
+  elif [[ -n "$FLEET" ]]; then
+    cert_role="$(fleet_cert_role "$FLEET")"
+  fi
+  case "$token_path" in
+    secret/github/fleet/pve/token) cert_role="${cert_role:-git-cert-pve}" ;;
+    secret/github/read/all)        cert_role="${cert_role:-git-cert-vm}" ;;
+  esac
+  [[ -n "${cert_role:-}" ]] || err "Agent profile needs --cert-role or a recognizable fleet token path"
+  case "$cert_role" in
+    git-cert-vm|git-cert-pve|git-cert-archive) ;;
+    *) err "invalid Agent certificate role: $cert_role" ;;
+  esac
+
+  if $CLIENT_CERT_SET; then client_cert="$CLIENT_CERT_ARG"; elif [[ -n "$EXISTING_CLIENT_CERT" ]]; then client_cert="$EXISTING_CLIENT_CERT"; else client_cert="$CLIENT_CERT_ARG"; fi
+  if $CLIENT_KEY_SET; then client_key="$CLIENT_KEY_ARG"; elif [[ -n "$EXISTING_CLIENT_KEY" ]]; then client_key="$EXISTING_CLIENT_KEY"; else client_key="$CLIENT_KEY_ARG"; fi
+  if $AGENT_TOKEN_SET; then agent_token="$AGENT_TOKEN_ARG"; elif [[ -n "$EXISTING_AGENT_TOKEN" ]]; then agent_token="$EXISTING_AGENT_TOKEN"; else agent_token="$AGENT_TOKEN_ARG"; fi
+  cert_hostname="${CERT_HOSTNAME_ARG:-${EXISTING_CERT_HOSTNAME:-}}"
+  if [[ -z "$cert_hostname" ]]; then
+    cert_hostname="$(hostname -s 2>/dev/null || true)"
+  fi
+  [[ "$cert_hostname" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] \
+    || err "cannot determine a valid short hostname for the client certificate; pass --cert-hostname"
+  [[ "$client_cert" = /* && "$client_cert" =~ ^[A-Za-z0-9./_-]+$ ]] \
+    || err "client certificate path is invalid: $client_cert"
+  [[ "$client_key" = /* && "$client_key" =~ ^[A-Za-z0-9./_-]+$ ]] \
+    || err "client key path is invalid: $client_key"
+  [[ "$agent_token" = /* && "$agent_token" =~ ^[A-Za-z0-9./_-]+$ ]] \
+    || err "Agent token path is invalid: $agent_token"
+  [[ "$agent_token" == /run/vault-agent/* ]] \
+    || err "Agent token path must be under /run/vault-agent"
+fi
+
+if ! $CONFIG_EXISTS || [[ -n "$AUTH_METHOD_ARG" ]] || {
+  [[ "$AUTH_METHOD" == agent ]] && {
+    [[ -n "$CERT_ROLE_ARG" ]] || $CERT_HOSTNAME_SET || $CLIENT_CERT_SET || $CLIENT_KEY_SET || $AGENT_TOKEN_SET
+  }
+}; then
+  config_tmp="$CONF_DIR/config.tmp.$$"
+  {
+    printf 'VAULT_ADDR=%s\n' "$config_addr"
+    [[ -n "$config_cacert" ]] && printf 'VAULT_CACERT=%s\n' "$config_cacert"
+    printf 'GIT_VAULT_AUTH_METHOD=%s\n' "$AUTH_METHOD"
+    printf 'GIT_VAULT_TOKEN_PATH=%s\n' "$token_path"
+    if [[ "$AUTH_METHOD" == agent ]]; then
+      printf 'GIT_VAULT_AGENT_TOKEN=%s\n' "$agent_token"
+      printf 'GIT_VAULT_CERT_ROLE=%s\n' "$cert_role"
+      printf 'GIT_VAULT_CERT_HOSTNAME=%s\n' "$cert_hostname"
+      printf 'GIT_VAULT_CLIENT_CERT=%s\n' "$client_cert"
+      printf 'GIT_VAULT_CLIENT_KEY=%s\n' "$client_key"
+    fi
+  } > "$config_tmp"
+  chown root:root "$config_tmp"
+  chmod 0640 "$config_tmp"
+  mv -f "$config_tmp" "$CONF_DIR/config"
+  log "wrote $CONF_DIR/config (auth-method=$AUTH_METHOD token-path=$token_path)"
+else
+  log "$CONF_DIR/config exists — keeping it (use --auth-method to switch explicitly)"
+fi
+
+# A shell-sourceable config is root code. Refuse an existing file that is not
+# root-owned and non-writable by group/other before it is used below.
+config_perms=$(stat -c '%u %a' "$CONF_DIR/config" 2>/dev/null || stat -f '%u %Lp' "$CONF_DIR/config")
+read -r config_owner config_mode <<< "$config_perms"
+[[ "$config_owner" == 0 ]] || err "$CONF_DIR/config must be owned by root"
+config_group_bits="${config_mode: -2:1}" ; config_other_bits="${config_mode: -1}"
+[[ "$config_group_bits" != [2367] && "$config_other_bits" != [2367] ]] \
+  || err "$CONF_DIR/config is group/world-writable (mode $config_mode)"
 
 # Interactive convenience only — cron/systemd consumers get VAULT_ADDR from
 # $CONF_DIR/config, never from profile.d. Value is re-validated and emitted
@@ -197,26 +382,43 @@ profile_addr="$(sed -n 's/^VAULT_ADDR=//p' "$CONF_DIR/config" | head -1)"
 if [[ "$profile_addr" =~ ^https?://[A-Za-z0-9.:_-]+$ ]]; then
   printf "export VAULT_ADDR='%s'\n" "$profile_addr" > /etc/profile.d/vault.sh
 else
-  log "WARN: VAULT_ADDR in config failed validation — not writing profile.d/vault.sh"
+  err "VAULT_ADDR in $CONF_DIR/config failed validation"
 fi
+config_token_path="$(sed -n 's/^GIT_VAULT_TOKEN_PATH=//p' "$CONF_DIR/config" | head -1)"
+[[ "$config_token_path" =~ ^[A-Za-z0-9/_.-]+$ ]] \
+  || err "GIT_VAULT_TOKEN_PATH in $CONF_DIR/config failed validation"
 
 # ---------------------------------------------------------------------------
-# Step 3 — credential helper (sha256-verified), scoped to github.com only
+# Step 3 — credential helper and Agent installer (sha256-verified), scoped to
+# github.com only
 # ---------------------------------------------------------------------------
 [[ -f "$HERE/git-credential-vault" ]] \
-  || err "git-credential-vault not found next to this script — fetch both files from the same pinned commit (see header)"
-if   command -v sha256sum >/dev/null; then SHA_TOOL="sha256sum"
-elif command -v shasum   >/dev/null; then SHA_TOOL="shasum -a 256"
-else err "need sha256sum or shasum"; fi
-# Copy to a root-only path FIRST, hash THAT, install THAT — hashing the copy
-# in a possibly world-writable download dir (/tmp) would be a TOCTOU window.
-helper_tmp="$(mktemp /root/.git-credential-vault.XXXXXX)"
-cp "$HERE/git-credential-vault" "$helper_tmp"
-actual_sha="$($SHA_TOOL "$helper_tmp" | awk '{print $1}')"
-[[ "$actual_sha" == "$EXPECTED_HELPER_SHA256" ]] \
-  || { rm -f "$helper_tmp"; err "git-credential-vault sha256 mismatch (got $actual_sha) — refusing to install an unreviewed helper"; }
-install -m 0755 "$helper_tmp" "$HELPER_DST"
-rm -f "$helper_tmp"
+  || err "git-credential-vault not found next to this script — fetch all files from the same pinned commit (see header)"
+[[ -f "$HERE/git-vault-install-client-cert" ]] \
+  || err "git-vault-install-client-cert not found next to this script — fetch all files from the same pinned commit"
+if command -v sha256sum >/dev/null; then
+  sha256_file() { sha256sum "$1"; }
+elif command -v shasum >/dev/null; then
+  sha256_file() { shasum -a 256 "$1"; }
+else
+  err "need sha256sum or shasum"
+fi
+
+install_verified() {
+  local src="$1" expected="$2" dst="$3" tmp actual
+  # Copy to a root-only path FIRST, hash THAT, install THAT — hashing the copy
+  # in a possibly world-writable download dir (/tmp) would be a TOCTOU window.
+  tmp="$(mktemp "/root/.keyvault-$(basename "$dst").XXXXXX")"
+  cp "$src" "$tmp"
+  actual="$(sha256_file "$tmp" | awk '{print $1}')"
+  [[ "$actual" == "$expected" ]] \
+    || { rm -f "$tmp"; err "$(basename "$src") sha256 mismatch (got $actual) — refusing to install an unreviewed file"; }
+  install -o root -g root -m 0755 "$tmp" "$dst"
+  rm -f "$tmp"
+}
+
+install_verified "$HERE/git-credential-vault" "$EXPECTED_HELPER_SHA256" "$HELPER_DST"
+install_verified "$HERE/git-vault-install-client-cert" "$EXPECTED_INSTALLER_SHA256" "$INSTALLER_DST"
 
 # Host-scoped helper for https://github.com. The empty-string reset clears
 # earlier entries at system AND global scope, so no stray `store`/custom
@@ -238,7 +440,137 @@ done
 log "helper installed + scoped (system+global): $(git config --system --get-all credential.https://github.com.helper | tr '\n' ' ')"
 
 # ---------------------------------------------------------------------------
-# Step 4 (optional) — SSH fallback transport
+# Step 4 (agent profile) — cert auth, Vault Agent, and token sink
+# ---------------------------------------------------------------------------
+if [[ "$AUTH_METHOD" == agent ]]; then
+  [[ -d /run/systemd/system ]] || err "--auth-method agent requires systemd"
+  root_only_file "$client_cert"
+  root_only_file "$client_key"
+  command -v openssl >/dev/null || err "openssl is required for the Agent client certificate"
+  openssl x509 -in "$client_cert" -noout -checkend 60 >/dev/null 2>&1 \
+    || err "client certificate is expired or expires within 60 seconds: $client_cert"
+  openssl pkey -in "$client_key" -noout >/dev/null 2>&1 \
+    || err "client key is not valid PEM: $client_key"
+
+  pki_role=""
+  case "$cert_role" in
+    git-cert-vm)      pki_role=git-vm ;;
+    git-cert-pve)     pki_role=git-pve ;;
+    git-cert-archive) pki_role=git-archive ;;
+  esac
+  [[ -n "$pki_role" ]] || err "no PKI role mapping for $cert_role"
+  VAULT_BIN="$(command -v vault)"
+  cert_fqdn="git-${cert_hostname}.impeng.net"
+
+  install -d -o root -g root -m 0700 "$AGENT_DIR"
+  agent_config_tmp="$AGENT_CONFIG.tmp.$$"
+  {
+    printf 'vault {\n'
+    printf '  address = "%s"\n' "$config_addr"
+    [[ -n "$config_cacert" ]] && printf '  ca_cert = "%s"\n' "$config_cacert"
+    printf '}\n\n'
+    cat <<EOF
+auto_auth {
+  method "cert" {
+    mount_path = "auth/cert"
+    config = {
+      name          = "$cert_role"
+      client_cert   = "$client_cert"
+      client_key    = "$client_key"
+      reload        = true
+      reload_period = "1m"
+    }
+  }
+
+  enable_reauth_on_new_credentials = true
+
+  sink "file" {
+    config = {
+      path  = "$agent_token"
+      mode  = "0600"
+      owner = "root"
+      group = "root"
+    }
+  }
+}
+
+template_config {
+  lease_renewal_threshold = 0.9
+}
+
+template {
+  source      = "$AGENT_TEMPLATE"
+  destination = "/run/vault-agent/rendered-client-cert"
+  perms       = "0600"
+  command     = "$INSTALLER_DST /run/vault-agent/rendered-client-cert $client_key $client_cert"
+}
+EOF
+  } > "$agent_config_tmp"
+  chown root:root "$agent_config_tmp"
+  chmod 0600 "$agent_config_tmp"
+  mv -f "$agent_config_tmp" "$AGENT_CONFIG"
+
+  agent_template_tmp="$AGENT_TEMPLATE.tmp.$$"
+  cat > "$agent_template_tmp" <<EOF
+{{ with pkiCert "pki-git-client/issue/$pki_role" "common_name=$cert_fqdn" "alt_names=$cert_fqdn" "ttl=720h" }}
+# KEY-BEGIN
+{{ .Key }}
+# KEY-END
+# CERT-BEGIN
+{{ .Cert }}
+{{ .CA }}
+# CERT-END
+{{ end }}
+EOF
+  chown root:root "$agent_template_tmp"
+  chmod 0600 "$agent_template_tmp"
+  mv -f "$agent_template_tmp" "$AGENT_TEMPLATE"
+
+  cat > "$AGENT_UNIT" <<EOF
+[Unit]
+Description=Vault Agent for GitHub credential access
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=$client_cert
+ConditionPathExists=$client_key
+
+[Service]
+Type=simple
+User=root
+Group=root
+UMask=0077
+RuntimeDirectory=vault-agent
+RuntimeDirectoryMode=0700
+ExecStart=$VAULT_BIN agent -config=$AGENT_CONFIG
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  chown root:root "$AGENT_UNIT"
+  chmod 0644 "$AGENT_UNIT"
+  systemctl daemon-reload
+  systemctl enable "$AGENT_UNIT" >/dev/null
+  systemctl restart vault-agent-git.service 2>/dev/null || systemctl start vault-agent-git.service
+
+  token_ready=false
+  for _ in {1..15}; do
+    if [[ -s "$agent_token" ]]; then token_ready=true; break; fi
+    sleep 1
+  done
+  $token_ready || err "Vault Agent did not produce token sink: $agent_token (check systemctl status vault-agent-git)"
+  root_only_file "$agent_token"
+  log "Vault Agent cert profile enabled: role=$cert_role cert=$client_cert key=$client_key token=$agent_token"
+elif [[ -n "$AUTH_METHOD_ARG" && "$AUTH_METHOD_ARG" == approle && -d /run/systemd/system ]]; then
+  # Explicit rollback from the Agent profile. Keep the certificate files for
+  # re-enrollment/recovery, but stop the Agent so only AppRole is used.
+  systemctl disable --now vault-agent-git.service 2>/dev/null || true
+  log "Vault Agent disabled; AppRole is now the configured auth method"
+fi
+
+# ---------------------------------------------------------------------------
+# Step 5 (optional) — SSH fallback transport
 # ---------------------------------------------------------------------------
 if $SSH_KEY_MODE; then
   [[ -f "$CONF_DIR/role-id" && -f "$CONF_DIR/secret-id" ]] \
@@ -306,10 +638,14 @@ fi
 # ---------------------------------------------------------------------------
 # Preflight report (warn, don't fail — creds may arrive after this script)
 # ---------------------------------------------------------------------------
-missing=""
-[[ -f "$CONF_DIR/role-id"   ]] || missing+=" role-id"
-[[ -f "$CONF_DIR/secret-id" ]] || missing+=" secret-id"
-[[ -n "$missing" ]] && log "WARN: missing$missing in $CONF_DIR — place them (root:root, 600) before git will work"
+if [[ "$AUTH_METHOD" == approle ]]; then
+  missing=""
+  [[ -f "$CONF_DIR/role-id"   ]] || missing+=" role-id"
+  [[ -f "$CONF_DIR/secret-id" ]] || missing+=" secret-id"
+  [[ -n "$missing" ]] && log "WARN: missing$missing in $CONF_DIR — place them (root:root, 600) before git will work"
+else
+  log "Vault Agent mode is active; token source is ${agent_token:-/run/vault-agent/token}"
+fi
 
 # shellcheck source=/dev/null
 source "$CONF_DIR/config"
