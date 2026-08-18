@@ -29,7 +29,8 @@
 # Usage:
 #   bootstrap.sh --fleet pve|vm [--auth-method approle|agent]
 #                [--cert-role git-cert-vm|git-cert-pve|git-cert-archive]
-#                [--cert-hostname HOST] [--client-cert PATH] [--client-key PATH]
+#                [--cert-hostname HOST] [--cert-domain DOMAIN]
+#                [--client-cert PATH] [--client-key PATH]
 #                [--agent-token PATH] [--vault-addr URL] [--vault-cacert PATH]
 #                [--with-cache] [--ssh-key]
 #
@@ -50,6 +51,9 @@
 #                     Use git-cert-archive for an archive writer.
 #   --cert-hostname H hostname used in the client certificate CN/DNS SAN;
 #                     defaults to hostname -s.
+#   --cert-domain D   DNS suffix used in the client certificate CN/DNS SAN;
+#                     defaults to the existing config value, or the suffix
+#                     reported by hostname -f. Required if neither is usable.
 #   --client-cert P  initial client certificate (default /etc/git-vault/client.crt)
 #   --client-key P   initial client key (default /etc/git-vault/client.key)
 #   --agent-token P  Agent token sink (default /run/vault-agent/token)
@@ -94,9 +98,11 @@ root_only_file() {
 [[ $EUID -eq 0 ]] || err "must run as root"
 
 FLEET="" VAULT_ADDR_ARG="" VAULT_CACERT_ARG="" AUTH_METHOD_ARG=""
-CERT_ROLE_ARG="" CERT_HOSTNAME_ARG="" CLIENT_CERT_ARG=/etc/git-vault/client.crt
+CERT_ROLE_ARG="" CERT_HOSTNAME_ARG="" CERT_DOMAIN_ARG=""
+CLIENT_CERT_ARG=/etc/git-vault/client.crt
 CLIENT_KEY_ARG=/etc/git-vault/client.key AGENT_TOKEN_ARG=/run/vault-agent/token
-CLIENT_CERT_SET=false CLIENT_KEY_SET=false AGENT_TOKEN_SET=false CERT_HOSTNAME_SET=false
+CLIENT_CERT_SET=false CLIENT_KEY_SET=false AGENT_TOKEN_SET=false
+CERT_HOSTNAME_SET=false CERT_DOMAIN_SET=false
 WITH_CACHE=false SSH_KEY_MODE=false
 while (( $# > 0 )); do
   case "$1" in
@@ -104,6 +110,7 @@ while (( $# > 0 )); do
     --auth-method)  AUTH_METHOD_ARG="${2:?--auth-method needs a value}"; shift 2 ;;
     --cert-role)    CERT_ROLE_ARG="${2:?--cert-role needs a value}"; shift 2 ;;
     --cert-hostname) CERT_HOSTNAME_ARG="${2:?--cert-hostname needs a value}"; CERT_HOSTNAME_SET=true; shift 2 ;;
+    --cert-domain) CERT_DOMAIN_ARG="${2:?--cert-domain needs a value}"; CERT_DOMAIN_SET=true; shift 2 ;;
     --client-cert)  CLIENT_CERT_ARG="${2:?--client-cert needs a value}"; CLIENT_CERT_SET=true; shift 2 ;;
     --client-key)   CLIENT_KEY_ARG="${2:?--client-key needs a value}"; CLIENT_KEY_SET=true; shift 2 ;;
     --agent-token)  AGENT_TOKEN_ARG="${2:?--agent-token needs a value}"; AGENT_TOKEN_SET=true; shift 2 ;;
@@ -136,8 +143,11 @@ for path_arg in "$CLIENT_CERT_ARG" "$CLIENT_KEY_ARG" "$AGENT_TOKEN_ARG"; do
   [[ "$path_arg" = /* && "$path_arg" =~ ^[A-Za-z0-9./_-]+$ ]] \
     || err "client/Agent paths must be absolute plain filesystem paths"
 done
-if [[ -n "$CERT_HOSTNAME_ARG" && ! "$CERT_HOSTNAME_ARG" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]]; then
-  err "--cert-hostname must be a short hostname label (letters, numbers, underscores, hyphens)"
+if [[ -n "$CERT_HOSTNAME_ARG" && ! "$CERT_HOSTNAME_ARG" =~ ^[A-Za-z0-9][A-Za-z0-9-]*$ ]]; then
+  err "--cert-hostname must be a DNS hostname label (letters, numbers, hyphens)"
+fi
+if [[ -n "$CERT_DOMAIN_ARG" && ! "$CERT_DOMAIN_ARG" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]]; then
+  err "--cert-domain must be a DNS domain such as aseva.net"
 fi
 
 # ---------------------------------------------------------------------------
@@ -249,6 +259,7 @@ EXISTING_CACERT=""
 EXISTING_TOKEN_PATH=""
 EXISTING_CERT_ROLE=""
 EXISTING_CERT_HOSTNAME=""
+EXISTING_CERT_DOMAIN=""
 EXISTING_CLIENT_CERT=""
 EXISTING_CLIENT_KEY=""
 EXISTING_AGENT_TOKEN=""
@@ -261,6 +272,7 @@ if [[ -f "$CONF_DIR/config" ]]; then
   EXISTING_TOKEN_PATH="$(sed -n 's/^GIT_VAULT_TOKEN_PATH=//p' "$CONF_DIR/config" | head -1)"
   EXISTING_CERT_ROLE="$(sed -n 's/^GIT_VAULT_CERT_ROLE=//p' "$CONF_DIR/config" | head -1)"
   EXISTING_CERT_HOSTNAME="$(sed -n 's/^GIT_VAULT_CERT_HOSTNAME=//p' "$CONF_DIR/config" | head -1)"
+  EXISTING_CERT_DOMAIN="$(sed -n 's/^GIT_VAULT_CERT_DOMAIN=//p' "$CONF_DIR/config" | head -1)"
   EXISTING_CLIENT_CERT="$(sed -n 's/^GIT_VAULT_CLIENT_CERT=//p' "$CONF_DIR/config" | head -1)"
   EXISTING_CLIENT_KEY="$(sed -n 's/^GIT_VAULT_CLIENT_KEY=//p' "$CONF_DIR/config" | head -1)"
   EXISTING_AGENT_TOKEN="$(sed -n 's/^GIT_VAULT_AGENT_TOKEN=//p' "$CONF_DIR/config" | head -1)"
@@ -273,7 +285,7 @@ else
 fi
 [[ "$AUTH_METHOD" == approle || "$AUTH_METHOD" == agent ]] \
   || err "unsupported auth method in $CONF_DIR/config: $AUTH_METHOD"
-if [[ "$AUTH_METHOD" != agent && ( -n "$CERT_ROLE_ARG" || -n "$CERT_HOSTNAME_ARG" || $CLIENT_CERT_SET == true || $CLIENT_KEY_SET == true || $AGENT_TOKEN_SET == true ) ]]; then
+if [[ "$AUTH_METHOD" != agent && ( -n "$CERT_ROLE_ARG" || -n "$CERT_HOSTNAME_ARG" || -n "$CERT_DOMAIN_ARG" || $CLIENT_CERT_SET == true || $CLIENT_KEY_SET == true || $AGENT_TOKEN_SET == true ) ]]; then
   err "certificate/Agent options require --auth-method agent"
 fi
 if $SSH_KEY_MODE && [[ "$AUTH_METHOD" != approle ]]; then
@@ -327,8 +339,22 @@ if [[ "$AUTH_METHOD" == agent ]]; then
   if [[ -z "$cert_hostname" ]]; then
     cert_hostname="$(hostname -s 2>/dev/null || true)"
   fi
-  [[ "$cert_hostname" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] \
+  [[ "$cert_hostname" =~ ^[A-Za-z0-9][A-Za-z0-9-]*$ ]] \
     || err "cannot determine a valid short hostname for the client certificate; pass --cert-hostname"
+  if $CERT_DOMAIN_SET; then
+    cert_domain="$CERT_DOMAIN_ARG"
+  elif [[ -n "$EXISTING_CERT_DOMAIN" ]]; then
+    cert_domain="$EXISTING_CERT_DOMAIN"
+  else
+    host_fqdn="$(hostname -f 2>/dev/null || true)"
+    if [[ "$host_fqdn" == "$cert_hostname".* ]]; then
+      cert_domain="${host_fqdn#"${cert_hostname}".}"
+    else
+      cert_domain=""
+    fi
+  fi
+  [[ "$cert_domain" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]] \
+    || err "cannot determine a valid certificate DNS domain; pass --cert-domain (for example aseva.net)"
   [[ "$client_cert" = /* && "$client_cert" =~ ^[A-Za-z0-9./_-]+$ ]] \
     || err "client certificate path is invalid: $client_cert"
   [[ "$client_key" = /* && "$client_key" =~ ^[A-Za-z0-9./_-]+$ ]] \
@@ -341,7 +367,7 @@ fi
 
 if ! $CONFIG_EXISTS || [[ -n "$AUTH_METHOD_ARG" ]] || {
   [[ "$AUTH_METHOD" == agent ]] && {
-    [[ -n "$CERT_ROLE_ARG" ]] || $CERT_HOSTNAME_SET || $CLIENT_CERT_SET || $CLIENT_KEY_SET || $AGENT_TOKEN_SET
+    [[ -n "$CERT_ROLE_ARG" ]] || $CERT_HOSTNAME_SET || $CERT_DOMAIN_SET || [[ -z "$EXISTING_CERT_DOMAIN" ]] || $CLIENT_CERT_SET || $CLIENT_KEY_SET || $AGENT_TOKEN_SET
   }
 }; then
   config_tmp="$CONF_DIR/config.tmp.$$"
@@ -354,6 +380,7 @@ if ! $CONFIG_EXISTS || [[ -n "$AUTH_METHOD_ARG" ]] || {
       printf 'GIT_VAULT_AGENT_TOKEN=%s\n' "$agent_token"
       printf 'GIT_VAULT_CERT_ROLE=%s\n' "$cert_role"
       printf 'GIT_VAULT_CERT_HOSTNAME=%s\n' "$cert_hostname"
+      printf 'GIT_VAULT_CERT_DOMAIN=%s\n' "$cert_domain"
       printf 'GIT_VAULT_CLIENT_CERT=%s\n' "$client_cert"
       printf 'GIT_VAULT_CLIENT_KEY=%s\n' "$client_key"
     fi
@@ -460,7 +487,7 @@ if [[ "$AUTH_METHOD" == agent ]]; then
   esac
   [[ -n "$pki_role" ]] || err "no PKI role mapping for $cert_role"
   VAULT_BIN="$(command -v vault)"
-  cert_fqdn="git-${cert_hostname}.impeng.net"
+  cert_fqdn="git-${cert_hostname}.${cert_domain}"
 
   install -d -o root -g root -m 0700 "$AGENT_DIR"
   agent_config_tmp="$AGENT_CONFIG.tmp.$$"
@@ -561,7 +588,7 @@ EOF
   done
   $token_ready || err "Vault Agent did not produce token sink: $agent_token (check systemctl status vault-agent-git)"
   root_only_file "$agent_token"
-  log "Vault Agent cert profile enabled: role=$cert_role cert=$client_cert key=$client_key token=$agent_token"
+  log "Vault Agent cert profile enabled: role=$cert_role identity=$cert_fqdn cert=$client_cert key=$client_key token=$agent_token"
 elif [[ -n "$AUTH_METHOD_ARG" && "$AUTH_METHOD_ARG" == approle && -d /run/systemd/system ]]; then
   # Explicit rollback from the Agent profile. Keep the certificate files for
   # re-enrollment/recovery, but stop the Agent so only AppRole is used.
