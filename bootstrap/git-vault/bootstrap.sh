@@ -6,8 +6,8 @@
 # vault repo's RUNBOOK-GITHUB-ACCESS.md).
 #
 # What it does (idempotent, re-runnable, root):
-#   1. Installs the HashiCorp Vault CLI (Debian/apt or RHEL-family/dnf) and
-#      MASKS vault.service — these hosts are Vault clients, never servers.
+#   1. Installs the HashiCorp Vault CLI and Git (Debian/apt or RHEL-family/dnf)
+#      and MASKS vault.service — these hosts are Vault clients, never servers.
 #   2. Writes /etc/git-vault/config (VAULT_ADDR, auth method, fleet token path).
 #   3. Installs the git-credential-vault helper (sha256-verified against the
 #      hash reviewed into THIS script) and scopes it to github.com only.
@@ -171,7 +171,7 @@ install_debian() {
   if [[ ! -f "$keyring" ]]; then
     command -v gpg >/dev/null || apt-get install -y gnupg >/dev/null
     local tmpkr; tmpkr="$(mktemp)"
-    curl -fsSL https://apt.releases.hashicorp.com/gpg | gpg --dearmor -o "$tmpkr" \
+    curl -fsSL https://apt.releases.hashicorp.com/gpg | gpg --dearmor --yes -o "$tmpkr" \
       || { rm -f "$tmpkr"; err "failed to fetch/dearmor HashiCorp signing key"; }
     local fpr
     fpr="$(gpg --show-keys --with-colons "$tmpkr" | awk -F: '$1=="fpr"{print $10; exit}')"
@@ -187,6 +187,10 @@ install_debian() {
     err "apt update failed for HashiCorp repo — codename '$codename' may not be published yet; re-run with HASHICORP_CODENAME=bookworm"
   fi
   command -v vault >/dev/null || apt-get install -y vault
+  if ! command -v git >/dev/null; then
+    apt-get update
+    apt-get install -y git
+  fi
 }
 
 install_rhel() {
@@ -209,6 +213,7 @@ REPO
     "$pkgmgr" -q makecache >/dev/null 2>&1 || true
   fi
   command -v vault >/dev/null || "$pkgmgr" install -y vault
+  command -v git >/dev/null || "$pkgmgr" install -y git
 }
 
 case "$os_id:$os_like" in
