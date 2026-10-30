@@ -93,8 +93,9 @@ os_id="${ID:-unknown}" os_like="${ID_LIKE:-}"
 
 # HashiCorp's published signing-key fingerprint — pinned and verified before
 # the keyring is trusted (matches the sha256-pinning posture of the rest of
-# this script).
-HASHICORP_GPG_FPR="798AEC654E5C15428C8E42EEAA16FCBCA621E701"
+# this script). Rotated by HashiCorp 2026-09-10 (HCSEC-2026-33); the current key
+# is listed at https://www.hashicorp.com/trust/security (previous: 798AEC65...A621E701).
+HASHICORP_GPG_FPR="D55C0D1AC78A8D8126CB631CFC9CA96ACA026560"
 
 install_debian() {
   local keyring=/usr/share/keyrings/hashicorp-archive-keyring.gpg
@@ -104,7 +105,7 @@ install_debian() {
   if [[ ! -f "$keyring" ]]; then
     command -v gpg >/dev/null || apt-get install -y gnupg >/dev/null
     local tmpkr; tmpkr="$(mktemp)"
-    curl -fsSL https://apt.releases.hashicorp.com/gpg | gpg --dearmor -o "$tmpkr" \
+    curl -fsSL https://apt.releases.hashicorp.com/gpg | gpg --batch --yes --dearmor -o "$tmpkr" \
       || { rm -f "$tmpkr"; err "failed to fetch/dearmor HashiCorp signing key"; }
     local fpr
     fpr="$(gpg --show-keys --with-colons "$tmpkr" | awk -F: '$1=="fpr"{print $10; exit}')"
